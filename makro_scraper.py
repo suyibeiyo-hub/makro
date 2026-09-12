@@ -178,6 +178,26 @@ def seller_price_in_rand(value: Any) -> float | None:
         return None
 
 
+def product_group_key(row: dict[str, Any]) -> tuple[str, str]:
+    """返回稳定的商品键，确保同一详情页的多个卖家归并到一组。"""
+    product_id = str(row.get("商品ID") or "").strip()
+    if product_id:
+        return ("id", product_id)
+
+    detail_url = str(row.get("商品网址") or row.get("详情页地址") or "").strip()
+    if detail_url:
+        parts = urlsplit(detail_url)
+        pid = (parse_qs(parts.query).get("pid") or [""])[0].strip()
+        if pid:
+            return ("pid", pid)
+        # 去掉 lid、store 等跟踪参数，避免同一详情页因链接参数不同而重复。
+        normalized = urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/") or "/", "", ""))
+        return ("url", normalized)
+
+    # 没有商品 ID 和地址时，不把多个未知商品错误地归为同一条。
+    return ("row", str(id(row)))
+
+
 def delivery_days(timestamp: Any, delivery_text: str = "") -> float | None:
     try:
         return math.ceil(max(0.0, (float(timestamp) - time.time() * 1000) / 86_400_000))
@@ -204,13 +224,40 @@ def delivery_days(timestamp: Any, delivery_text: str = "") -> float | None:
 
 
 def choose_lowest_offer(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    priced = [r for r in rows if r.get("价格") is not None]
-    return min(priced, key=effective_price) if priced else None
+    priced: list[tuple[float, dict[str, Any]]] = []
+    for row in rows:
+        price = effective_price(row)
+        if price is not None:
+            priced.append((price, row))
+    return min(priced, key=lambda item: item[0])[1] if priced else None
 
 
 def effective_price(row: dict[str, Any]) -> float | None:
     """筛选/比价用价格：优惠价优先，否则原价，最后才回退到价格。"""
-    return row.get("优惠价") or row.get("原价") or row.get("价格")
+    for field in ("优惠价", "原价", "价格"):
+        value = row.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def deduplicate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一商品只保留有效价格最低的卖家记录，保留原始出现顺序。"""
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(product_group_key(row), []).append(row)
+
+    result: list[dict[str, Any]] = []
+    for offers in grouped.values():
+        best = choose_lowest_offer(offers)
+        result.append(best if best is not None else offers[0])
+    return result
 
 
 def scrape(url: str, pincode: str, max_pages: int | None, workers: int,
@@ -264,7 +311,7 @@ def scrape(url: str, pincode: str, max_pages: int | None, workers: int,
             })
         if progress_callback:
             progress_callback("已处理第 1 条商品")
-        return rows
+        return deduplicate_rows(rows)
 
     all_rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -345,15 +392,15 @@ def scrape(url: str, pincode: str, max_pages: int | None, workers: int,
         if not page_data.get("hasMorePages", False):
             break
         page += 1
-    return all_rows
+    return deduplicate_rows(all_rows)
 
 
 def filter_rows(rows: list[dict[str, Any]], min_days: float, min_price_rand: float,
                 enabled: bool = True) -> list[dict[str, Any]]:
     """每个产品先取最低价卖家，再按送达天数和价格筛选。"""
-    by_product: dict[str, list[dict[str, Any]]] = {}
+    by_product: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
-        by_product.setdefault(row.get("商品ID", ""), []).append(row)
+        by_product.setdefault(product_group_key(row), []).append(row)
     result = []
     for offers in by_product.values():
         best = choose_lowest_offer(offers)
