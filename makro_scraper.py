@@ -26,15 +26,27 @@ API_BASE = "https://www.makro.co.za"
 PAGE_API = f"{API_BASE}/fccng/api/4/page/fetch"
 SELLER_API = f"{API_BASE}/fccng/api/3/page/dynamic/product-sellers"
 DEFAULT_PINCODE = "2157"
+SORT_OPTIONS = ("price_asc", "price_desc")
 
 
-def set_page(url: str, page: int) -> str:
+def url_page_number(url: str) -> int:
+    """读取 URL 中的 page 参数，没有或无效时返回第 1 页。"""
+    raw_page = (parse_qs(urlsplit(url).query).get("page") or [""])[0]
+    try:
+        return max(1, int(raw_page))
+    except (TypeError, ValueError):
+        return 1
+
+
+def set_page(url: str, page: int, sort_order: str | None = None) -> str:
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     if page == 1:
         query.pop("page", None)
     else:
         query["page"] = str(page)
+    if sort_order in SORT_OPTIONS:
+        query["sort"] = sort_order
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -261,7 +273,21 @@ def deduplicate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def scrape(url: str, pincode: str, max_pages: int | None, workers: int,
-           progress_callback: Callable[[str], None] | None = None) -> list[dict[str, Any]]:
+           progress_callback: Callable[[str], None] | None = None,
+           page_start: int | None = None, page_end: int | None = None,
+           sort_order: str | None = None) -> list[dict[str, Any]]:
+    """抓取商品；page_start/page_end/sort_order 非空时覆盖 URL 参数。"""
+    page_start = url_page_number(url) if page_start is None else max(1, int(page_start))
+    if page_end is not None:
+        page_end = max(1, int(page_end))
+        if page_end < page_start:
+            raise ValueError("结束页不能小于开始页")
+    if sort_order not in (None, *SORT_OPTIONS):
+        raise ValueError(f"排序参数必须是 {SORT_OPTIONS[0]} 或 {SORT_OPTIONS[1]}")
+    # 兼容旧的 max_pages 参数：它表示从开始页起最多抓多少页。
+    if page_end is None and max_pages is not None:
+        page_end = page_start + max(1, int(max_pages)) - 1
+
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
@@ -316,14 +342,19 @@ def scrape(url: str, pincode: str, max_pages: int | None, workers: int,
     all_rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     first_context = None
+    # 从第 N 页开始时，先请求第 1 页只获取分页上下文，确保接口能正确跳到 N 页。
+    if page_start > 1:
+        context_response = fetch_page(session, set_page(url, 1, sort_order), 1, None, session_ids)
+        context_data = (context_response.get("RESPONSE") or {}).get("pageData") or {}
+        first_context = context_data.get("paginationContextMap", {}).get("federator")
     previous_page_ids: tuple[str, ...] | None = None
     processed_products = 0
-    page = 1
-    while max_pages is None or page <= max_pages:
-        page_url = set_page(url, page)
+    page = page_start
+    while page_end is None or page <= page_end:
+        page_url = set_page(url, page, sort_order)
         response = fetch_page(session, page_url, page, first_context, session_ids)
         page_data = (response.get("RESPONSE") or {}).get("pageData") or {}
-        if page == 1:
+        if page == 1 and first_context is None:
             first_context = page_data.get("paginationContextMap", {}).get("federator")
         products = get_products(response)
         if not products:
@@ -472,11 +503,15 @@ def cli_main() -> int:
     parser.add_argument("--pincode", default=DEFAULT_PINCODE, help="配送邮编，默认 2157")
     parser.add_argument("--min-days", type=float, default=15)
     parser.add_argument("--min-price", type=float, default=300, help="实际兰特金额")
-    parser.add_argument("--max-pages", type=int, default=None, help="最大页数；不设置则一直翻页直到没有下一页")
+    parser.add_argument("--sort", choices=SORT_OPTIONS, default=None, help="覆盖 URL 的排序参数")
+    parser.add_argument("--page-start", type=int, default=None, help="开始页；不设置则使用 URL 的 page")
+    parser.add_argument("--page-end", type=int, default=None, help="结束页；不设置则一直翻页直到没有下一页")
+    parser.add_argument("--max-pages", type=int, default=None, help="兼容旧参数：从开始页起最多抓多少页")
     parser.add_argument("--workers", type=int, default=5)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    rows = scrape(args.url, args.pincode, args.max_pages, max(1, min(args.workers, 10)))
+    rows = scrape(args.url, args.pincode, args.max_pages, max(1, min(args.workers, 10)),
+                  page_start=args.page_start, page_end=args.page_end, sort_order=args.sort)
     filtered = filter_rows(rows, args.min_days, args.min_price)
     export_xlsx(rows, filtered, args.output)
     print(f"完成：抓取 {len(rows)} 条卖家记录，筛选 {len(filtered)} 个产品 -> {args.output}")
@@ -487,7 +522,7 @@ def gui_main() -> int:
     from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
     from PySide6.QtWidgets import (QApplication, QCheckBox, QFormLayout, QHBoxLayout,
                                    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-                                   QPlainTextEdit, QDoubleSpinBox, QSpinBox, QVBoxLayout,
+                                   QPlainTextEdit, QDoubleSpinBox, QSpinBox, QComboBox, QVBoxLayout,
                                    QWidget, QGroupBox)
 
     class Worker(QObject):
@@ -495,15 +530,20 @@ def gui_main() -> int:
         finished = Signal(str, int, int)
         failed = Signal(str)
 
-        def __init__(self, url: str, pincode: str, max_pages: int | None, min_days: float, min_price: float, output: str):
+        def __init__(self, url: str, pincode: str, page_start: int | None, page_end: int | None,
+                     sort_order: str | None, min_days: float, min_price: float, output: str):
             super().__init__()
-            self.args = (url, pincode, max_pages, 5)
+            self.url, self.pincode = url, pincode
+            self.page_start, self.page_end, self.sort_order = page_start, page_end, sort_order
             self.min_days, self.min_price, self.output = min_days, min_price, output
 
         @Slot()
         def run(self):
             try:
-                rows = scrape(*self.args, progress_callback=self.progress.emit)
+                rows = scrape(self.url, self.pincode, None, 5,
+                              progress_callback=self.progress.emit,
+                              page_start=self.page_start, page_end=self.page_end,
+                              sort_order=self.sort_order)
                 self.progress.emit(f"已处理完成，共 {len(rows)} 条卖家记录")
                 filtered = filter_rows(rows, self.min_days, self.min_price, True)
                 export_xlsx(rows, filtered, self.output)
@@ -542,9 +582,19 @@ def gui_main() -> int:
             self.price = QDoubleSpinBox(); self.price.setRange(0, 1_000_000); self.price.setValue(300); self.price.setPrefix("R ")
             condition_form.addRow("预计送达大于", self.days); condition_form.addRow("价格大于", self.price); layout.addWidget(condition_box)
 
-            page_box = QGroupBox("分页设置"); page_form = QFormLayout(page_box)
-            page_line = QHBoxLayout(); self.limit_pages = QCheckBox("限制最大页数"); self.pages = QSpinBox(); self.pages.setRange(1, 1000); self.pages.setValue(100); self.pages.setEnabled(False); self.limit_pages.toggled.connect(self.pages.setEnabled); page_line.addWidget(self.limit_pages); page_line.addWidget(self.pages); page_line.addStretch()
-            page_form.addRow("翻页模式", page_line); layout.addWidget(page_box)
+            page_box = QGroupBox("分页与排序（可覆盖 URL 参数）"); page_form = QFormLayout(page_box)
+            self.sort = QComboBox()
+            self.sort.addItem("跟随 URL 参数", "")
+            self.sort.addItem("价格从低到高（price_asc）", "price_asc")
+            self.sort.addItem("价格从高到低（price_desc）", "price_desc")
+            self.page_start = QLineEdit(); self.page_start.setMaximumWidth(180); self.page_start.setPlaceholderText("留空使用 URL 的 page")
+            self.page_end = QLineEdit(); self.page_end.setMaximumWidth(180); self.page_end.setPlaceholderText("留空则抓到没有下一页")
+            page_form.addRow("排序参数 sort", self.sort)
+            page_form.addRow("开始页 page_start", self.page_start)
+            page_form.addRow("结束页 page_end", self.page_end)
+            page_hint = QLabel("例如：开始页 10、结束页 20，只抓第 10 到 20 页；留空的设置不会覆盖 URL。")
+            page_hint.setStyleSheet("color: #667085; font-size: 12px;")
+            page_form.addRow("", page_hint); layout.addWidget(page_box)
 
             self.start = QPushButton("保存 Excel"); self.start.clicked.connect(self.start_job); layout.addWidget(self.start)
             self.status = QLabel("准备就绪"); layout.addWidget(self.status)
@@ -554,11 +604,28 @@ def gui_main() -> int:
             if not self.url.text().strip():
                 QMessageBox.warning(self, "缺少网址", "请输入 Makro 分类页 URL")
                 return
+            url = self.url.text().strip()
+            try:
+                page_start = int(self.page_start.text().strip()) if self.page_start.text().strip() else None
+                page_end = int(self.page_end.text().strip()) if self.page_end.text().strip() else None
+            except ValueError:
+                QMessageBox.warning(self, "页码无效", "开始页和结束页必须是整数。")
+                return
+            if page_start is not None and page_start < 1:
+                QMessageBox.warning(self, "页码无效", "开始页必须大于或等于 1。")
+                return
+            if page_end is not None and page_end < 1:
+                QMessageBox.warning(self, "页码无效", "结束页必须大于或等于 1。")
+                return
+            resolved_start = page_start if page_start is not None else url_page_number(url)
+            if page_end is not None and page_end < resolved_start:
+                QMessageBox.warning(self, "页码无效", "结束页不能小于开始页。")
+                return
+            sort_order = self.sort.currentData() or None
             self.start.setEnabled(False); self.status.setText("处理中，请等待..."); self.log.clear()
-            max_pages = self.pages.value() if self.limit_pages.isChecked() else None
             run_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path.cwd()
             output = str(run_dir / f"makro_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-            self.thread = QThread(); self.worker = Worker(self.url.text().strip(), self.pin.text().strip(), max_pages, self.days.value(), self.price.value(), output)
+            self.thread = QThread(); self.worker = Worker(url, self.pin.text().strip(), page_start, page_end, sort_order, self.days.value(), self.price.value(), output)
             self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run)
             self.worker.finished.connect(self.done); self.worker.failed.connect(self.error)
             self.worker.progress.connect(self.add_progress)
